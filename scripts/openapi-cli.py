@@ -89,11 +89,20 @@ class AuthManager:
 
     @staticmethod
     def _save_token(access_token: str, expires_in: int):
-        TOKEN_CACHE.write_text(json.dumps({
-            "access_token": access_token,
-            "expires_at": int(time.time()) + expires_in,
-        }))
+        TOKEN_CACHE.write_text(
+            json.dumps(
+                {
+                    "access_token": access_token,
+                    "expires_at": int(time.time()) + expires_in,
+                }
+            )
+        )
         TOKEN_CACHE.chmod(0o600)
+
+    @classmethod
+    def clear_cache(cls):
+        """清空 token 缓存"""
+        cls._save_token("", 0)
 
     @classmethod
     def ensure(cls) -> str:
@@ -120,6 +129,7 @@ class AuthManager:
 # ═══════════════════════════════════════════════════════════
 # Spec 管理
 # ═══════════════════════════════════════════════════════════
+
 
 class SpecManager:
     """拉取、缓存、查询 OpenAPI Spec."""
@@ -156,7 +166,7 @@ class SpecManager:
         SPEC_CACHE.write_text(json.dumps(spec, ensure_ascii=False))
         return spec
 
-    def _match_path(template: str, path: str) -> bool:
+    def _match_path(self, template: str, path: str) -> bool:
         """将模板 /a/{b}/c 与实际 /a/123/c 匹配."""
         t_parts = template.strip("/").split("/")
         p_parts = path.strip("/").split("/")
@@ -196,12 +206,14 @@ class SpecManager:
             for method, op in methods.items():
                 if keyword and keyword.lower() not in path.lower():
                     continue
-                result.append({
-                    "method": method.upper(),
-                    "path": path,
-                    "summary": op.get("summary", ""),
-                    "tags": ", ".join(op.get("tags", [])),
-                })
+                result.append(
+                    {
+                        "method": method.upper(),
+                        "path": path,
+                        "summary": op.get("summary", ""),
+                        "tags": ", ".join(op.get("tags", [])),
+                    }
+                )
         result.sort(key=lambda x: (x["path"], x["method"]))
         return result
 
@@ -351,6 +363,7 @@ class AccessPolicy:
 # 参数解析器
 # ═══════════════════════════════════════════════════════════
 
+
 class ParamResolver:
     """从 operation 对象提取参数定义，并解析用户输入."""
 
@@ -419,6 +432,7 @@ class ParamResolver:
 # HTTP Client
 # ═══════════════════════════════════════════════════════════
 
+
 class APIClient:
     def __init__(self, spec: SpecManager):
         self.spec = spec
@@ -434,6 +448,19 @@ class APIClient:
         if headers:
             hdrs.update(headers)
 
+        print(f"\n=== HTTP 请求明细 ===")
+        print(f"📤 方法: {method.upper()}")
+        print(f"🌐 URL: {url}")
+
+        if query:
+            print(f"🔍 查询参数: {query}")
+
+        if body:
+            print(f"📦 请求体:")
+            import json
+
+            print(json.dumps(body, ensure_ascii=False, indent=2))
+
         resp = requests.request(
             method=method.upper(),
             url=url,
@@ -445,7 +472,7 @@ class APIClient:
 
         if resp.status_code == 401:
             # Token 过期，刷新重试一次
-            self.auth._save_token("", 0)  # 清缓存
+            self.auth.clear_cache()  # 清缓存
             hdrs["Authorization"] = f"Bearer {self.auth.ensure()}"
             resp = requests.request(
                 method=method.upper(),
@@ -459,42 +486,76 @@ class APIClient:
         resp.raise_for_status()
         data = resp.json()
         # 自动解包 {status, message, data} 外层包装
-        if isinstance(data, dict) and "status" in data and "data" in data:
-            if data["status"] not in (200, 0):
+        if isinstance(data, dict) and "status" in data:
+            status = data["status"]
+            if status not in (200, 0):
+                if status == 401:
+                    self.auth.clear_cache()
                 sys.exit(f"❌ API 错误 [{data.get('status')}]: {data.get('message')}")
             data = data["data"]
         return data
 
-    def call(self, method: str, path: str, params: dict,
-             body: dict | None = None, paginate: bool = False) -> dict:
+    def call(
+        self,
+        method: str,
+        path: str,
+        params: dict,
+        body: dict | None = None,
+        paginate: bool = False,
+    ) -> dict:
         """执行 API 调用，支持自动分页."""
         op = self.spec.resolve(method, path)
-        req = ParamResolver(op).build_request_args(params, path)
+        resolver = ParamResolver(op)
+        req = resolver.build_request_args(params, path)
         # --data 显式传入的 body 优先级高于 spec 推导的 body
-        merged_body = body if body else req.get("body") or None
+        merged_body = body if body is not None else req.get("body") or None
         if body and req.get("body"):
             merged_body = {**req["body"], **body}
 
         if not paginate:
-            return self._request(method, req["path"], req["query"], merged_body, req["headers"])
+            return self._request(
+                method, req["path"], req["query"], merged_body, req["headers"]
+            )
 
         # 全量分页
         all_rows = []
         page = 1
-        page_size = params.get("pageSize", params.get("size", 2000))
+        page_size = params.get("pageSize", params.get("size", 200))
 
         while True:
             p = {**params, "pageIndex": page, "pageSize": page_size}
-            req2 = ParamResolver(op).build_request_args(p, path)
-            mb = {**req2.get("body", {}), **(body or {})}
-            data = self._request(method, req2["path"], req2["query"], mb, req2["headers"])
+            req2 = resolver.build_request_args(p, path)
+            # 分页循环中，分页参数必须优先，不能被用户原始 body 覆盖
+            base_body = req2.get("body") or {}
+            user_body = body or {}
+            merged_page_body = {
+                **base_body,
+                **user_body,
+                "pageIndex": page,
+                "pageSize": page_size,
+            }
+
+            data = self._request(
+                method, req2["path"], req2["query"], merged_page_body, req2["headers"]
+            )
             rows = data.get("data", []) if isinstance(data, dict) else data
             if not rows:
                 break
             all_rows.extend(rows)
-            total = data.get("totalCount", data.get("total", 0)) if isinstance(data, dict) else 0
-            print(f"\r  获取第 {page} 页 ({len(all_rows)}/{total})...", end="", flush=True, file=sys.stderr)
-            if len(all_rows) >= total:
+            total = (
+                data.get("totalCount", data.get("total", 0))
+                if isinstance(data, dict)
+                else 0
+            )
+            print(
+                f"\r  获取第 {page} 页 ({len(all_rows)}/{total})...",
+                end="",
+                flush=True,
+                file=sys.stderr,
+            )
+            if total and len(all_rows) >= total:
+                break
+            if len(rows) < page_size:
                 break
             page += 1
 
@@ -505,6 +566,7 @@ class APIClient:
 # ═══════════════════════════════════════════════════════════
 # 输出格式化
 # ═══════════════════════════════════════════════════════════
+
 
 class OutputFormatter:
     @staticmethod
@@ -531,6 +593,7 @@ class OutputFormatter:
 # CLI 主入口
 # ═══════════════════════════════════════════════════════════
 
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="OpenAPI CLI（基于 OpenAPI Spec）",
@@ -540,32 +603,38 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", help="子命令")
 
     # ── call: 通用 API 调用 ──
-    call = sub.add_parser("call", help="通用 API 调用: METHOD PATH [--params]",
-                          aliases=["GET", "POST", "PUT", "DELETE", "PATCH"])
-    call.add_argument("method", nargs="?", default="GET",
-                      help="HTTP 方法 (GET/POST/PUT/DELETE/PATCH)")
+    call = sub.add_parser(
+        "call",
+        help="通用 API 调用: METHOD PATH [--params]",
+        aliases=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    )
+    call.add_argument(
+        "method", nargs="?", default="GET", help="HTTP 方法 (GET/POST/PUT/DELETE/PATCH)"
+    )
     call.add_argument("path", help="API 路径，如 /user/list")
-    call.add_argument("--params", "-p", nargs="*", default=[],
-                      help="查询参数: --param key=value ...")
-    call.add_argument("--data", "-d", default=None,
-                      help="请求体: JSON 字符串 或 @文件.json")
-    call.add_argument("--all", action="store_true", dest="paginate",
-                      help="自动分页获取全量数据")
-    call.add_argument("--format", "-f", choices=["json", "table"], default="table",
-                      help="输出格式")
-    call.add_argument("--cols", nargs="*", default=None,
-                      help="表格显示哪些列")
+    call.add_argument(
+        "--params", "-p", nargs="*", default=[], help="查询参数: --param key=value ..."
+    )
+    call.add_argument(
+        "--data", "-d", default=None, help="请求体: JSON 字符串 或 @文件.json"
+    )
+    call.add_argument(
+        "--all", action="store_true", dest="paginate", help="自动分页获取全量数据"
+    )
+    call.add_argument(
+        "--format", "-f", choices=["json", "table"], default="table", help="输出格式"
+    )
+    call.add_argument("--cols", nargs="*", default=None, help="表格显示哪些列")
 
     # ── list-paths ──
-    lp = sub.add_parser("list-paths", help="列出所有 API 路径",
-                        aliases=["paths"])
-    lp.add_argument("--filter", "-k", default=None, dest="keyword",
-                    help="按关键字过滤")
+    lp = sub.add_parser("list-paths", help="列出所有 API 路径", aliases=["paths"])
+    lp.add_argument("--filter", "-k", default=None, dest="keyword", help="按关键字过滤")
     lp.add_argument("--format", "-f", choices=["json", "table"], default="table")
 
     # ── describe ──
-    desc = sub.add_parser("describe", help="查看 API 详情（参数、响应）",
-                          aliases=["desc"])
+    desc = sub.add_parser(
+        "describe", help="查看 API 详情（参数、响应）", aliases=["desc"]
+    )
     desc.add_argument("method", help="HTTP 方法")
     desc.add_argument("path", help="API 路径")
 
@@ -577,11 +646,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("refresh", help="重新拉取 OpenAPI Spec")
 
     # ── policy ──
-    pol = sub.add_parser("policy", help="查看当前访问策略",
-                         aliases=["pol"])
-    pol.add_argument("action", nargs="?", default="show",
-                     choices=["show", "init"],
-                     help="show=查看策略 / init=生成默认策略文件")
+    pol = sub.add_parser("policy", help="查看当前访问策略", aliases=["pol"])
+    pol.add_argument(
+        "action",
+        nargs="?",
+        default="show",
+        choices=["show", "init"],
+        help="show=查看策略 / init=生成默认策略文件",
+    )
 
     return p
 
@@ -597,6 +669,8 @@ def parse_extra_params(args) -> dict:
                 v = True
             elif v.lower() == "false":
                 v = False
+            elif v.lower() == "null":
+                params[k] = None
             elif v.isdigit():
                 v = int(v)
             params[k] = v
@@ -619,7 +693,10 @@ def cmd_call(spec: SpecManager, client: APIClient, args, policy: AccessPolicy):
     op = spec.resolve(method, path)
     if op is None:
         print(f"❌ 未找到: {method} {path}", file=sys.stderr)
-        print(f"💡 试试: openapi-cli list-paths --filter {path.split('/')[1]}", file=sys.stderr)
+        print(
+            f"💡 试试: openapi-cli list-paths --filter {path.split('/')[1]}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # ── 访问控制检查 ──
@@ -649,7 +726,10 @@ def cmd_call(spec: SpecManager, client: APIClient, args, policy: AccessPolicy):
         return
 
     total = data.get("totalCount", len(rows)) if isinstance(data, dict) else len(rows)
-    print(f"\n📋 {op.get('summary', method + ' ' + path)} (共 {total} 条)\n", file=sys.stderr)
+    print(
+        f"\n📋 {op.get('summary', method + ' ' + path)} (共 {total} 条)\n",
+        file=sys.stderr,
+    )
 
     if args.cols:
         OutputFormatter.table(rows, args.cols)
@@ -752,7 +832,9 @@ def main():
             print(policy.describe(), file=sys.stderr)
             if not POLICY_FILE.exists():
                 print("\n💡 策略文件不存在，当前使用默认安全策略。", file=sys.stderr)
-                print("   openapi-cli policy init 生成可编辑的策略模板", file=sys.stderr)
+                print(
+                    "   openapi-cli policy init 生成可编辑的策略模板", file=sys.stderr
+                )
         return
 
     if args.command == "list-paths" or args.command == "paths":
@@ -786,11 +868,11 @@ def _init_policy():
         "allow_paths": [],
         "deny_paths": [],
         "_examples": {
-            "allow_tags": "[\"用户管理\"]  只允许用户管理 tag 的接口",
-            "deny_methods": "[\"DELETE\", \"PUT\"]  禁止这些 HTTP 方法",
-            "allow_paths": "[\"POST /user/list\", \"GET /user/detail\"]  只需要这些",
-            "deny_paths": "[\"DELETE /user/*\"]  精确禁止特定路径"
-        }
+            "allow_tags": '["用户管理"]  只允许用户管理 tag 的接口',
+            "deny_methods": '["DELETE", "PUT"]  禁止这些 HTTP 方法',
+            "allow_paths": '["POST /user/list", "GET /user/detail"]  只需要这些',
+            "deny_paths": '["DELETE /user/*"]  精确禁止特定路径',
+        },
     }
     if POLICY_FILE.exists():
         print(f"⚠️  策略文件已存在: {POLICY_FILE}", file=sys.stderr)
